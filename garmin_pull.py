@@ -25,6 +25,7 @@ from pullers.hrv import HrvPuller
 from pullers.vo2_max import Vo2MaxPuller
 from pullers.training_load import TrainingLoadPuller
 from pullers.exercises import ExercisesPuller
+from pullers.sleep import SleepPuller
 from health import start_health_server
 
 load_dotenv()
@@ -136,7 +137,7 @@ def main_long_running():
     scheduler.add_job(
         run_pullers,
         CronTrigger(hour=7, minute=0, timezone="UTC"),
-        args=[client, [HrvPuller, Vo2MaxPuller, TrainingLoadPuller], "daily"],
+        args=[client, [HrvPuller, Vo2MaxPuller, TrainingLoadPuller, SleepPuller], "daily"],
         id="daily",
     )
 
@@ -149,7 +150,7 @@ def main_long_running():
     run_pullers(
         client,
         [HeartRatePuller, StepsPuller, BodyBatteryPuller, StressPuller,
-         ExercisesPuller, HrvPuller, Vo2MaxPuller, TrainingLoadPuller],
+         ExercisesPuller, HrvPuller, Vo2MaxPuller, TrainingLoadPuller, SleepPuller],
         "startup",
     )
 
@@ -196,7 +197,8 @@ def main_one_shot():
             HeartRatePuller(client), StepsPuller(client),
             BodyBatteryPuller(client), StressPuller(client),
             HrvPuller(client), Vo2MaxPuller(client),
-            TrainingLoadPuller(client), ExercisesPuller(client),
+            TrainingLoadPuller(client), SleepPuller(client),
+            ExercisesPuller(client),
         ]
 
     conn = get_db_conn()
