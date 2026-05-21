@@ -1,0 +1,262 @@
+{
+  "name": "Health — Morning Digest v3",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "triggerAtHour": 9
+            }
+          ]
+        }
+      },
+      "id": "0f71f265-83e3-4c73-9b2a-2f083bf14a59",
+      "name": "Every Day 09:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -1344,
+        208
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH night_sessions AS (\n  SELECT *\n  FROM sleep_sessions\n  WHERE start_time >= (CURRENT_DATE - INTERVAL '12 hours')\n    AND start_time <  (CURRENT_DATE + INTERVAL '12 hours')\n),\nby_source AS (\n  SELECT\n    source,\n    MIN(start_time) AS start_time,\n    MAX(end_time)   AS end_time,\n    SUM(duration_minutes) AS duration_minutes,\n    SUM(deep_minutes)  AS deep_minutes,\n    SUM(rem_minutes)   AS rem_minutes,\n    SUM(light_minutes) AS light_minutes,\n    SUM(awake_minutes) AS awake_minutes,\n    GREATEST(\n      EXTRACT(EPOCH FROM (MAX(end_time) - MIN(start_time))) / 60\n        - SUM(duration_minutes), 0\n    )::int AS gap_minutes,\n    COUNT(*) AS segments,\n    MAX(sleep_score) AS sleep_score,\n    AVG(avg_spo2)::numeric(4,1) AS avg_spo2,\n    MIN(min_spo2) AS min_spo2,\n    AVG(avg_skin_temp)::numeric(4,2) AS avg_skin_temp,\n    ROUND((SUM(avg_heart_rate * duration_minutes) / NULLIF(SUM(duration_minutes), 0))::numeric, 1) AS avg_heart_rate,\n    MIN(min_heart_rate) AS min_heart_rate,\n    MAX(max_heart_rate) AS max_heart_rate\n  FROM night_sessions\n  GROUP BY source\n),\nbest_source AS (\n  SELECT source\n  FROM by_source\n  ORDER BY duration_minutes DESC NULLS LAST, segments DESC, start_time DESC\n  LIMIT 1\n)\nSELECT bs.*\nFROM by_source bs\nJOIN best_source b ON bs.source = b.source;",
+        "options": {}
+      },
+      "id": "eb9219c9-15a6-43a4-a28b-ac8dbed0e877",
+      "name": "Get Last Night",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -1120,
+        112
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "7sjzrcKYg83FMjER",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH\nhybrid_hr AS (\n  SELECT measured_at, bpm\n  FROM heart_rate\n  WHERE measured_at >= CURRENT_DATE - 7\n    AND measured_at < CURRENT_DATE\n    AND source = 'garmin'\n  UNION ALL\n  SELECT hr.measured_at, hr.bpm\n  FROM heart_rate hr\n  JOIN sleep_sessions ss\n    ON hr.measured_at BETWEEN ss.start_time AND ss.end_time\n  WHERE hr.source = 'health_connect'\n    AND hr.measured_at >= CURRENT_DATE - 7\n    AND hr.measured_at < CURRENT_DATE\n),\nhr_yday AS (\n  SELECT measured_at, bpm\n  FROM heart_rate\n  WHERE measured_at::date = CURRENT_DATE - 1\n    AND source = 'garmin'\n  UNION ALL\n  SELECT hr.measured_at, hr.bpm\n  FROM heart_rate hr\n  JOIN sleep_sessions ss\n    ON hr.measured_at BETWEEN ss.start_time AND ss.end_time\n  WHERE hr.source = 'health_connect'\n    AND hr.measured_at::date = CURRENT_DATE - 1\n)\nSELECT json_build_object(\n\n  'sleep', (\n    SELECT json_agg(row_to_json(s) ORDER BY date DESC, source) FROM (\n      SELECT start_time::date AS date, source, duration_minutes, sleep_score,\n        deep_minutes, rem_minutes, light_minutes, awake_minutes,\n        avg_spo2, avg_heart_rate, min_heart_rate\n      FROM sleep_sessions\n      WHERE start_time >= NOW() - INTERVAL '7 days'\n      ORDER BY start_time DESC\n    ) s\n  ),\n\n  'steps_daily', (\n    SELECT json_agg(row_to_json(st)) FROM (\n      SELECT period_start::date AS date, SUM(steps) AS steps\n      FROM steps\n      WHERE period_start >= CURRENT_DATE - 7\n        AND period_start < CURRENT_DATE\n        AND source = 'garmin'\n      GROUP BY 1 ORDER BY 1 DESC\n    ) st\n  ),\n\n  'steps_hourly_yesterday', (\n    SELECT json_agg(row_to_json(sh)) FROM (\n      SELECT date_trunc('hour', period_start) AS hour, SUM(steps) AS steps\n      FROM steps\n      WHERE period_start::date = CURRENT_DATE - 1\n        AND source = 'garmin'\n      GROUP BY 1 ORDER BY 1\n    ) sh\n  ),\n\n  'heart_rate_daily', (\n    SELECT json_agg(row_to_json(hr)) FROM (\n      SELECT measured_at::date AS date,\n        MIN(bpm) AS resting_hr,\n        AVG(bpm)::int AS avg_hr,\n        MAX(bpm) AS max_hr,\n        COUNT(*) AS samples\n      FROM heart_rate\n      WHERE measured_at >= CURRENT_DATE - 7\n        AND measured_at < CURRENT_DATE\n        AND source = 'garmin'\n      GROUP BY 1 ORDER BY 1 DESC\n    ) hr\n  ),\n\n  'heart_rate_hourly_yesterday', (\n    SELECT json_agg(row_to_json(hrh)) FROM (\n      SELECT date_trunc('hour', measured_at) AS hour,\n        AVG(bpm)::int AS avg_hr,\n        MIN(bpm) AS min_hr,\n        MAX(bpm) AS max_hr\n      FROM heart_rate\n      WHERE measured_at::date = CURRENT_DATE - 1\n        AND source = 'garmin'\n      GROUP BY 1 ORDER BY 1\n    ) hrh\n  ),\n\n  'calories_daily', (\n    WITH params AS (\n      SELECT 100.0 AS weight_kg, 173.0 AS height_cm, 55 AS age\n    ),\n    per_minute AS (\n      SELECT\n        measured_at::date AS date,\n        date_trunc('minute', measured_at) AS minute,\n        AVG(bpm) AS bpm\n      FROM hybrid_hr\n      GROUP BY 1, 2\n    ),\n    calc AS (\n      SELECT\n        pm.date,\n        GREATEST(\n          (10*p.weight_kg + 6.25*p.height_cm - 5*p.age + 5) / 1440.0,\n          (-55.0969 + 0.6309*pm.bpm + 0.1988*p.weight_kg + 0.2017*p.age) / 4.184\n        ) AS kcal_per_min\n      FROM per_minute pm CROSS JOIN params p\n    )\n    SELECT json_agg(row_to_json(c)) FROM (\n      SELECT\n        date,\n        ROUND(SUM(kcal_per_min))::int AS kcal_total,\n        COUNT(*) AS minutes_with_hr,\n        ROUND(AVG(kcal_per_min)::numeric, 2) AS kcal_per_min_avg\n      FROM calc\n      GROUP BY date ORDER BY date DESC\n    ) c\n  ),\n\n  'calories_hourly_yesterday', (\n    WITH params AS (\n      SELECT 100.0 AS weight_kg, 173.0 AS height_cm, 55 AS age\n    ),\n    per_minute AS (\n      SELECT\n        date_trunc('hour', measured_at) AS hour,\n        date_trunc('minute', measured_at) AS minute,\n        AVG(bpm) AS bpm\n      FROM hr_yday\n      GROUP BY 1, 2\n    )\n    SELECT json_agg(row_to_json(c)) FROM (\n      SELECT\n        pm.hour,\n        ROUND(SUM(\n          GREATEST(\n            (10*p.weight_kg + 6.25*p.height_cm - 5*p.age + 5) / 1440.0,\n            (-55.0969 + 0.6309*pm.bpm + 0.1988*p.weight_kg + 0.2017*p.age) / 4.184\n          )\n        ))::int AS kcal\n      FROM per_minute pm CROSS JOIN params p\n      GROUP BY pm.hour ORDER BY pm.hour\n    ) c\n  ),\n\n  'weight', (\n    SELECT json_agg(row_to_json(w)) FROM (\n      SELECT measured_at, weight_kg FROM weight_log\n      WHERE measured_at >= NOW() - INTERVAL '30 days'\n      ORDER BY measured_at DESC LIMIT 10\n    ) w\n  ),\n\n  'exercises', (\n    SELECT json_agg(row_to_json(e)) FROM (\n      SELECT\n        exercise_type, start_time,\n        ROUND(duration_seconds / 60.0)::int AS duration_minutes,\n        ROUND((distance_meters / 1000.0)::numeric, 2) AS distance_km,\n        avg_hr, max_hr, calories,\n        training_effect_aerobic AS te_aerobic,\n        training_effect_anaerobic AS te_anaerobic,\n        training_load,\n        avg_speed_mps,\n        elevation_gain_m\n      FROM exercises\n      WHERE start_time >= NOW() - INTERVAL '7 days'\n        AND source = 'garmin'\n      ORDER BY start_time DESC\n    ) e\n  ),\n\n  'body_battery_daily', (\n    SELECT json_agg(row_to_json(bb)) FROM (\n      SELECT date, start_value, end_value, max_value, min_value, charged, drained\n      FROM body_battery_daily\n      WHERE date >= CURRENT_DATE - 7\n        AND source = 'garmin'\n      ORDER BY date DESC\n    ) bb\n  ),\n\n  'stress_daily', (\n    SELECT json_agg(row_to_json(s)) FROM (\n      SELECT date, overall_avg, rest_minutes, low_minutes, medium_minutes, high_minutes\n      FROM stress_daily\n      WHERE date >= CURRENT_DATE - 7\n        AND source = 'garmin'\n      ORDER BY date DESC\n    ) s\n  ),\n\n  'training_load_current', (\n    SELECT row_to_json(tl) FROM (\n      SELECT date, acute_load_7d, chronic_load_28d, ratio, status, focus\n      FROM training_load_daily\n      WHERE source = 'garmin'\n      ORDER BY date DESC LIMIT 1\n    ) tl\n  ),\n\n  'hrv_daily', (\n    SELECT json_agg(row_to_json(h)) FROM (\n      SELECT date, last_night_avg, last_night_5min_high, weekly_avg, status\n      FROM hrv_daily\n      WHERE date >= CURRENT_DATE - 7\n        AND source = 'garmin'\n      ORDER BY date DESC\n    ) h\n  ),\n\n  'vo2_max_daily', (\n    SELECT json_agg(row_to_json(v)) FROM (\n      SELECT date, running_value, cycling_value, fitness_age\n      FROM vo2_max_daily\n      WHERE date >= CURRENT_DATE - 7\n        AND source = 'garmin'\n      ORDER BY date DESC\n    ) v\n  ),\n\n  'nutrition_daily', (\n    SELECT json_agg(row_to_json(n)) FROM (\n      SELECT date, calories_in, protein_g, fat_g, saturated_fat_g,\n             carbs_g, fiber_g, sugar_g, sodium_mg, entries_count\n      FROM nutrition_daily\n      WHERE date >= CURRENT_DATE - 7\n        AND source = 'fatsecret'\n      ORDER BY date DESC\n    ) n\n  )\n\n) AS context;",
+        "options": {}
+      },
+      "id": "627e360c-6130-4b66-a86d-3af1dafec890",
+      "name": "Get Week Context",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -1120,
+        320
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "7sjzrcKYg83FMjER",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const lastNightRow = $('Get Last Night').first()?.json;\nconst lastNight = lastNightRow?.start_time ? lastNightRow : null;\nconst ctx = $('Get Week Context').first().json.context;\nconst hasSleep = !!lastNight;\n\nconst yKcalOut = ctx?.calories_daily?.[0]?.kcal_total;\nconst yKcalIn = ctx?.nutrition_daily?.[0]?.calories_in;\n\nlet fragmentationNote = '';\nif (hasSleep) {\n  const segments = lastNight.segments || 1;\n  const gap = lastNight.gap_minutes || 0;\n  if (segments > 1) {\n    fragmentationNote = '\\n- ВАЖНО: ночь фрагментирована на ' + segments\n      + ' сегмент(а), общее время бодрствования между ними ' + gap\n      + ' мин. Это нормальный паттерн для людей с прерывистым сном '\n      + '(встал в туалет, поработал ночью, плохо спалось). '\n      + 'Анализируй СУММАРНУЮ длительность и качество, '\n      + 'не пугайся коротких отдельных сегментов.';\n  }\n}\n\nconst sleepSection = hasSleep\n  ? `## ДАННЫЕ ЗА ПОСЛЕДНЮЮ НОЧЬ (источник: ${lastNight.source})\n- Начало сна: ${new Date(lastNight.start_time).toLocaleString('ru-RU', {timeZone:'Europe/Moscow'})}\n- Пробуждение: ${new Date(lastNight.end_time).toLocaleString('ru-RU', {timeZone:'Europe/Moscow'})}\n- Длительность: ${lastNight.duration_minutes} мин\n- Sleep score: ${lastNight.sleep_score ?? '?'}\n- Фазы: глубокий ${lastNight.deep_minutes ?? '?'}м, REM ${lastNight.rem_minutes ?? '?'}м, лёгкий ${lastNight.light_minutes ?? '?'}м, бодрствование ${lastNight.awake_minutes ?? '?'}м\n- ЧСС во сне: среднее ${lastNight.avg_heart_rate ?? '?'}, мин ${lastNight.min_heart_rate ?? '?'}\n- SpO2: среднее ${lastNight.avg_spo2 ?? '?'}%, мин ${lastNight.min_spo2 ?? '?'}%${fragmentationNote}`\n  : `## ДАННЫЕ ЗА ПОСЛЕДНЮЮ НОЧЬ\n- Записей о сне за прошлую ночь нет (ни кольцо, ни Garmin, ни Health Connect).\n- Раздел «Сон» напиши коротко: данных нет, оцени восстановление по Body Battery, HRV, stress и активности.`;\n\nconst prompt = `Ты — персональный AI-консультант по здоровью. Дай комплексную ежедневную оценку на русском языке\n\n${sleepSection}\n\n## КОНТЕКСТ ЗА 7 ДНЕЙ (JSON)\n${JSON.stringify(ctx, null, 2)}\n\n## МЕТОДОЛОГИЯ АНАЛИЗА\n\n### Сон\n- Оптимальная длительность: 7-9 часов\n- Глубокий сон: норма 15-20% от общего времени\n- REM: норма 20-25%\n- ЧСС покоя во сне: <60 хорошо, <50 отлично\n- В контексте sleep могут быть записи из разных источников (garmin, health_connect, samsung_ring). Для трендов смотри все, но прошлую ночь уже выбран лучший доступный источник.\n\n### Фрагментация сна\nЕсли segments > 1 — ночь была разбита на части. Это бывает (вставание в туалет, временное бодрствование). Не катастрофа, если суммарно сна ≥ 7 часов. Тревожный знак — если gap > 60 мин и сегментов 3+. Анализируй качество СУММЫ, не отдельных сегментов.\n\n### Пульс\n- Покоя: <60 отлично, 60-80 норма, >80 повышен\n- Тренд ЧСС покоя: снижение = улучшение формы, рост = перетренированность/стресс/болезнь\n\n### Активность\n- ВОЗ: 7000-10000 шагов/день, 150 мин умеренной активности в неделю\n\n### Калории (Keytel, гибрид Garmin+кольцо)\nВ контексте:\n- calories_daily — расход за день (BMR + активные)\n- calories_hourly_yesterday — почасовая разбивка вчера\n- nutrition_daily — потребление из FatSecret\n\nНорма расхода для мужчины 55 лет, 100 кг, 173 см:\n- Сидячий день: 1900-2100 ккал\n- Обычная активность: 2200-2800 ккал\n- С тренировкой: 2800-3500 ккал\n\n### Энергобаланс\nbalance = calories_in − calories_out\n- Дефицит -300...-500 → потеря веса (~0.5 кг/нед)\n- Профицит +300...+500 → набор веса\n- Баланс ±200 → поддержание\n\n### Тренировки (Garmin)\n- training_effect_aerobic: 0-5 (0-1.9 нет эффекта, 2-2.9 базовый, 3-3.9 улучшение, 4-4.9 высокий, 5 запредельный)\n- training_load: нагрузка тренировки в условных единицах\n- exercise_type: hiking, running, cycling, swimming и т.д.\n\n### Training Load Status (Garmin)\n- ratio = acute_load_7d / chronic_load_28d (отношение острой к хронической нагрузке)\n- ratio 0.8-1.3 — OPTIMAL, оптимальная зона прогрессии\n- ratio 0.5-0.8 — LOW, нагрузка ниже хронической базы, начинается детренинг\n- ratio <0.5 — глубокий LOW, фактический детренинг, организм адаптирован к гораздо большей нагрузке чем сейчас даётся\n- ratio 1.3-1.5 — HIGH, повышенный риск перетренированности\n- ratio >1.5 — VERY_HIGH, высокий риск травм\n\nВАЖНО: при LOW не пиши \"можно увеличить интенсивность\" — это маскирует серьёзность. Пиши прямо: \"недогруз относительно адаптированной формы, нужно вернуться к привычному объёму\". Низкий ratio после долгого перерыва означает что хроническая база ещё держится, но скоро упадёт если не добавить нагрузку.\n\n### Body Battery (Garmin, шкала 0-100)\n- Утренний (start_value): 60-90 норма после хорошего сна, <50 — недовосстановление\n- Вечерний (end_value): естественное падение от утреннего\n- charged − drained за день должен быть близок к нулю при балансе\n\n### Stress (Garmin, минуты в зонах)\n- rest_minutes: периоды восстановления (сон+медитация+спокойное время)\n- high_minutes: периоды реального стресса\n- Норма: rest > medium+high; перекос в high_minutes >180 мин/день — тревожный знак\n\n### HRV (Garmin)\n- status: BALANCED норма, UNBALANCED отклонение от персональной нормы, LOW/POOR низкое восстановление\n- Конкретные числа индивидуальны, важен СТАТУС и ТРЕНД\n- ВАЖНО: данные могут быть NULL (часы не на ночь). Если NULL — пропусти раздел молча.\n\n### VO2 Max (Garmin)\n- Появляется только после бега или велосипеда с GPS\n- Если NULL — пропусти раздел молча, НЕ упоминай отсутствие.\n\n### Питание (FatSecret)\nНормы для мужчины 55 лет, 100 кг при поддержании веса:\n- Калории: ~2400-2800 в день\n- Белок: 1.2-1.6 г/кг = 120-160 г\n- Жиры: 25-35% калорий = 65-95 г\n- Углеводы: 45-55% калорий = 270-380 г\n- Клетчатка: ≥30 г/день\n- Сахар: <50 г/день\n- Натрий: <2300 мг/день\n\n### Интрадневные паттерны\nВ контексте есть почасовая разбивка за вчера (heart_rate_hourly_yesterday, steps_hourly_yesterday, calories_hourly_yesterday). Используй для анализа: пики стресса в рабочее время, периоды неподвижности, восстановление после нагрузки.\n\n## ВАЖНЫЕ ПРАВИЛА\n1. Если поле в JSON приходит NULL или массив пуст — НЕ упоминай \"нет данных\", просто пропусти раздел.\n2. Не выдумывай значения. Если HRV/VO2 пустые — раздел не пишешь вообще.\n3. Цифры из контекста бери в исходном виде, не округляй грубо.\n4. Связывай разделы между собой: тренировка → нагрузка → восстановление → сон → энергия.\n5. По весу тренды считай только по реальным интервалам между измерениями, не интерполируй. Если ты увидел \"-1.8 кг\" — указывай \"за N дней между измерениями\", не \"за неделю\".\n6. Дайджест обязателен даже без данных о сне — просто сократи раздел «Сон».\n\n## ЗАДАНИЕ\n\n1. **Сон** — качество прошлой ночи или отметка об отсутствии данных\n2. **Восстановление** — Body Battery, HRV (если есть), stress баланс, ЧСС покоя\n3. **Активность** — шаги, тренировки, training effect\n4. **Тренировочная нагрузка** — Training Load Status, ratio, рекомендация по интенсивности на сегодня\n5. **Энергобаланс** — потрачено vs съедено, БЖУ, отклонения\n6. **Тренды и связи** — корреляции между сном, нагрузкой, питанием, восстановлением\n7. **Рекомендации** — 3-4 конкретных действия на сегодня\n\nФормат: структурированный по разделам, краткий. Максимум 500 слов. Стиль — компетентный врач-друг, без воды.`;\n\nreturn [{ json: { prompt, lastNight, ctx, hasSleep } }];"
+      },
+      "id": "07f5634b-51d4-4a07-b718-63c660f07913",
+      "name": "Build Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -880,
+        208
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-api-key",
+              "value": "REPLACE_WITH_YOUR_ANTHROPIC_API_KEY"
+            },
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"claude-sonnet-4-20250514\",\n  \"max_tokens\": 2048,\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": {{ JSON.stringify($json.prompt) }}\n    }\n  ]\n}",
+        "options": {
+          "timeout": 90000
+        }
+      },
+      "id": "3a104be5-a783-4507-a950-4cc9e22b5c63",
+      "name": "Claude API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -656,
+        208
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const response = $input.first().json;\nconst interpretation = response.content?.[0]?.text || 'Ошибка: пустой ответ от Claude';\n\nconst buildPrompt = $('Build Prompt').first().json;\nconst lastNight = buildPrompt.lastNight;\nconst ctx = buildPrompt.ctx;\n\nconst parts = [];\n\nif (lastNight?.duration_minutes) {\n  const h = Math.floor(lastNight.duration_minutes / 60);\n  const m = lastNight.duration_minutes % 60;\n  let sleep = `🌙 ${h}ч${m.toString().padStart(2, '0')}м`;\n  if (lastNight.source) sleep += ` [${lastNight.source}]`;\n  if (lastNight.deep_minutes) {\n    sleep += ` (💜${lastNight.deep_minutes} 🧠${lastNight.rem_minutes || '?'} 💚${lastNight.light_minutes || '?'})`;\n  }\n  if ((lastNight.segments || 1) > 1) {\n    sleep += ` ⚠${lastNight.segments}ч`;\n  }\n  parts.push(sleep);\n} else {\n  parts.push('🌙 нет данных о сне');\n}\n\nif (lastNight?.min_heart_rate) parts.push(`❤️ ${lastNight.min_heart_rate}`);\nif (lastNight?.avg_spo2) parts.push(`🫁 ${lastNight.avg_spo2}%`);\nif (ctx?.steps_daily?.[0]?.steps) parts.push(`🚶 ${ctx.steps_daily[0].steps}`);\n\nconst bb = ctx?.body_battery_daily?.[0];\nif (bb?.start_value) parts.push(`🔋 ${bb.start_value}`);\n\nconst tl = ctx?.training_load_current;\nif (tl?.status) {\n  const statusShort = { LOW: 'LOW', OPTIMAL: 'OPT', HIGH: 'HIGH', VERY_HIGH: 'V.HIGH' }[tl.status] || tl.status;\n  parts.push(`📈 ${statusShort}`);\n}\n\nconst kcalOut = ctx?.calories_daily?.[0]?.kcal_total;\nconst kcalIn = ctx?.nutrition_daily?.[0]?.calories_in;\nif (kcalOut && kcalIn) {\n  const balance = kcalIn - kcalOut;\n  const sign = balance >= 0 ? '+' : '';\n  parts.push(`🍽️ ${kcalIn}/${kcalOut} (${sign}${balance})`);\n} else if (kcalOut) {\n  parts.push(`🔥 ${kcalOut}`);\n}\n\nif (ctx?.weight?.[0]?.weight_kg) parts.push(`⚖️ ${ctx.weight[0].weight_kg}кг`);\n\nconst header = parts.join(' | ') + '\\n\\n';\nconst telegramText = header + interpretation;\n\nreturn [{ json: {\n  interpretation,\n  telegramText,\n  tokens_in: response.usage?.input_tokens,\n  tokens_out: response.usage?.output_tokens,\n  model: response.model\n} }];"
+      },
+      "id": "fcf8f01c-db75-487c-b05b-9b687ad95b65",
+      "name": "Format Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -448,
+        208
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO health_insights (\n  date, insight_type, model,\n  prompt_tokens, completion_tokens,\n  interpretation, sent_to_telegram\n) VALUES (\n  CURRENT_DATE,\n  'daily_health',\n  '{{ $json.model }}',\n  {{ $json.tokens_in ?? 'NULL' }},\n  {{ $json.tokens_out ?? 'NULL' }},\n  {{ $json.interpretation ? \"'\" + $json.interpretation.replace(/'/g, \"''\") + \"'\" : 'NULL' }},\n  true\n);",
+        "options": {}
+      },
+      "id": "a7037318-0a19-4797-9bf3-c7a25c0f9823",
+      "name": "Save Insight",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -224,
+        112
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "7sjzrcKYg83FMjER",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "@varioustestshippo",
+        "text": "={{ $('Format Response').first().json.telegramText }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "Markdown"
+        }
+      },
+      "id": "4cfe9827-ca09-4aa3-8932-0381f646357b",
+      "name": "Send Telegram",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -224,
+        320
+      ],
+      "webhookId": "e0904b11-5b5a-42af-958f-428b66919d14",
+      "credentials": {
+        "telegramApi": {
+          "id": "jPCXfnH34oj0dcqV",
+          "name": "TG for TESTS"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Every Day 09:00": {
+      "main": [
+        [
+          {
+            "node": "Get Last Night",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Last Night": {
+      "main": [
+        [
+          {
+            "node": "Get Week Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Week Context": {
+      "main": [
+        [
+          {
+            "node": "Build Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Prompt": {
+      "main": [
+        [
+          {
+            "node": "Claude API",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claude API": {
+      "main": [
+        [
+          {
+            "node": "Format Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Response": {
+      "main": [
+        [
+          {
+            "node": "Save Insight",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Send Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "versionId": "ff0ea3d1-b067-4919-8193-89c246349d7b",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "37c1bec5477bc5881c36f29ac7b9dab276628a9c7b18952c9c8961bf5c12fae5"
+  },
+  "id": "IeqDAJ6iLimey59r",
+  "tags": []
+}
