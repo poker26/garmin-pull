@@ -133,7 +133,15 @@ def main_long_running():
         next_run_time=now_utc + timedelta(minutes=5),
     )
 
-    # Каждый день в 07:00 UTC (10:00 МСК): daily-метрики
+    # 05:30 UTC (08:30 МСК): сон — до утреннего дайджеста в n8n (~10:30 МСК)
+    scheduler.add_job(
+        run_pullers,
+        CronTrigger(hour=5, minute=30, timezone="UTC"),
+        args=[client, [SleepPuller], "sleep_early"],
+        id="sleep_early",
+    )
+
+    # Каждый день в 07:00 UTC (10:00 МСК): daily-метрики (+ повтор sleep на случай задержки Garmin)
     scheduler.add_job(
         run_pullers,
         CronTrigger(hour=7, minute=0, timezone="UTC"),
